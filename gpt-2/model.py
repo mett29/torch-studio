@@ -13,6 +13,14 @@ class HParams:
     n_head: int = 12
     n_layer: int = 12
 
+def default_hparams():
+    return HParams(
+        n_vocab=0,
+        n_ctx=1024,
+        n_embd=768,
+        n_head=12,
+        n_layer=12,
+    )
 
 def shape_list(x: Tensor):
     """
@@ -153,6 +161,7 @@ def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
                 of shape [batch_size, hparams.n_layer, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head].
                 This can be used as input to 'past' in future calls to maintain continuity of memory across time steps.
     """
+    print(f"x shape at the start of attn(): {x.shape}")
     assert x.dim() == 3  # Should be [batch, sequence, features]
     assert n_state % hparams.n_head == 0
     if past is not None:
@@ -188,7 +197,7 @@ def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
 
     def multihead_attn(q: Tensor, k: Tensor, v: Tensor):
         # q, k, v have shape [batch, heads, sequence, features]
-        w = torch.matmul(q, k.t())
+        w = torch.matmul(q, k.T)
         # Attention weights are scaled by the inverse square root of the key's dimensionality
         d_k = v.size(-1)
         w = w / torch.sqrt(torch.tensor(d_k, dtype=w.dtype))
@@ -199,7 +208,11 @@ def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
 
     # Increases the number of features by 3 times to then generate q, k, v
     c = conv1d(x, n_state*3)
-    q, k, v = map(split_heads, torch.split(c, 3, dim=2))
+    print(f"c shape: {c.shape}")
+    q, k, v = map(split_heads, c.chunk(3, dim=2))
+    print(f"q shape: {q.shape}")
+    print(f"k shape: {k.shape}")
+    print(f"v shape: {v.shape}")
     present = torch.stack([k, v], dim=1)
     if past is not None:
         # If past is provided, it means that there is previous
@@ -254,8 +267,6 @@ def expand_tile(value: Tensor, size: int):
     """
     # Convert to tensor if not already a tensor
     value = torch.as_tensor(value)
-    # Add a new dimension at the 0-th axis
-    value = value.unsqueeze(0)
     # Repeat the tensor along the new dimension 'size' times.
     # The *([1] * value.dim()) ensures the tensor is repeated
     # only along the new dimension while keeping the other dimensions unchanged.
@@ -317,11 +328,18 @@ def model(hparams: HParams, X: Tensor, past: Tensor | None = None):
     batch, sequence = shape_list(X)
 
     # Initialize positional and token embeddings with the specified shapes
-    wpe = torch.randn(hparams.n_ctx, hparams.n_embd) * 0.01    # Positional Embeddings
-    wte = torch.randn(hparams.n_vocab, hparams.n_embd) * 0.02  # Token Embeddings
-    past_length = 0 if past is None else past.size(-2)
+    wpe = torch.normal(0.0, 0.01, (hparams.n_ctx, hparams.n_embd))    # Positional Embeddings
+    wte = torch.normal(0.0, 0.02, (hparams.n_vocab, hparams.n_embd))  # Token Embeddings
+    past_length = 0 if past is None else past.shape[-2]
     # Gather token and positional embeddings
+
+    print(f"Shape of X: {X.shape}")
+    print(f"Max index in X: {X.max()}")
+    print(f"Shape of wte: {wte.shape}")
+    print(f"Shape of wpe: {wpe.shape}")
+
     h = wte[X] + wpe[positions_for(X, past_length)]
+    print(f"Shape of h: {h.shape}")
 
     # Initialize presents and pasts for the transformer layers
     presents = []
@@ -338,13 +356,8 @@ def model(hparams: HParams, X: Tensor, past: Tensor | None = None):
 
     # Prepare the logits for language model loss
     h_flat = torch.reshape(h, [batch*sequence, hparams.n_embd])
-    logits = torch.matmul(h_flat, wte.t())
+    logits = torch.matmul(h_flat, wte.T)
     logits = torch.reshape(logits, [batch, sequence, hparams.n_vocab])
     # Store logits in results
     results['logits'] = logits
     return results
-
-
-if __name__ == "__main__":
-    # Debug
-    print(attention_mask(nd=4, ns=4, dtype=torch.int32))
