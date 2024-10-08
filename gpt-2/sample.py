@@ -120,7 +120,7 @@ def sample_sequence(
         logits = top_k_logits(logits, k=top_k)
         logits = top_p_logits(logits, p=top_p)
         # Sample from the distribution
-        samples = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
+        samples = torch.multinomial(torch.softmax(logits, dim=0), num_samples=1)
         return [
             next_outputs['presents'] if past is None else torch.cat([past, next_outputs['presents']], dim=-2),
             samples,
