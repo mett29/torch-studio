@@ -32,9 +32,9 @@ def softmax(x: Tensor, dim: int = -1):
     """
     Softmax function.
     """
-    x = x - torch.max(x, dim=dim, keepdim=True)
+    x = x - torch.max(x, dim=dim, keepdim=True).values
     ex = torch.exp(x)
-    return ex / torch.max(ex, dim=dim, keepdim=True)
+    return ex / torch.max(ex, dim=dim, keepdim=True).values
 
 def gelu(x: Tensor):
     """
@@ -197,11 +197,14 @@ def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
 
     def multihead_attn(q: Tensor, k: Tensor, v: Tensor):
         # q, k, v have shape [batch, heads, sequence, features]
-        w = torch.matmul(q, k.T)
+        print(f"q shape in multihead_attn: {q.shape}")
+        print(f"k.mT shape in multihead_attn: {k.mT.shape}")
+        w = torch.matmul(q, k.mT)
         # Attention weights are scaled by the inverse square root of the key's dimensionality
         d_k = v.size(-1)
         w = w / torch.sqrt(torch.tensor(d_k, dtype=w.dtype))
         w = mask_attn_weights(w)
+        print(f"w shape in multihead_attn: {w.shape}")
         w = softmax(w)
         a = torch.matmul(w, v)
         return a
@@ -356,7 +359,7 @@ def model(hparams: HParams, X: Tensor, past: Tensor | None = None):
 
     # Prepare the logits for language model loss
     h_flat = torch.reshape(h, [batch*sequence, hparams.n_embd])
-    logits = torch.matmul(h_flat, wte.T)
+    logits = torch.matmul(h_flat, wte.mT)
     logits = torch.reshape(logits, [batch, sequence, hparams.n_vocab])
     # Store logits in results
     results['logits'] = logits

@@ -102,7 +102,12 @@ def sample_sequence(
 
         logits = lm_output['logits'][:, :, :hparams.n_vocab]
         presents = lm_output['present']
-        presents.set_shape(model.past_shape(hparams=hparams, batch_size=batch_size))
+        print(f"batch size: {batch_size}")
+        sequence_length = tokens.size(1)
+        print(f"sequence length: {sequence_length}")
+        past_shape = model.past_shape(hparams=hparams, batch_size=batch_size, sequence=sequence_length)
+        print(f"past shape: {past_shape}")
+        presents = presents.reshape(past_shape)
         return {
             'logits': logits,
             'presents': presents,

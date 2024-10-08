@@ -132,8 +132,8 @@ class Encoder:
             bpe_tokens.extend(self.encoder[bpe_token] for bpe_token in self.bpe(token).split(' '))
         return bpe_tokens
 
-    def decode(self, tokens: list):
-        text = ''.join([self.decoder[token] for token in tokens])
+    def decode(self, tokens):
+        text = ''.join([self.decoder[int(token)] for token in tokens])
         text = bytearray([self.byte_decoder[c] for c in text]).decode('utf-8', errors=self.errors)
         return text
 
