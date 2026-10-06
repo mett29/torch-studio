@@ -13,6 +13,7 @@ class HParams:
     n_head: int = 12
     n_layer: int = 12
 
+
 def default_hparams():
     return HParams(
         n_vocab=0,
@@ -22,11 +23,13 @@ def default_hparams():
         n_layer=12,
     )
 
+
 def shape_list(x: Tensor):
     """
     Get the shape of a PyTorch tensor as a list of integers.
     """
     return list(x.size())
+
 
 def softmax(x: Tensor, dim: int = -1):
     """
@@ -34,7 +37,8 @@ def softmax(x: Tensor, dim: int = -1):
     """
     x = x - torch.max(x, dim=dim, keepdim=True).values
     ex = torch.exp(x)
-    return ex / torch.max(ex, dim=dim, keepdim=True).values
+    return ex / torch.sum(ex, dim=dim, keepdim=True)
+
 
 def gelu(x: Tensor):
     """
@@ -44,20 +48,28 @@ def gelu(x: Tensor):
     as an approximation:
     https://arxiv.org/pdf/1606.08415
     """
-    return 0.5*x*(1+torch.tanh(np.sqrt(2/torch.pi)*(x+0.044715*torch.pow(x,3))))
+    return (
+        0.5
+        * x
+        * (1 + torch.tanh(np.sqrt(2 / torch.pi) * (x + 0.044715 * torch.pow(x, 3))))
+    )
+
 
 def norm(x: Tensor, *, dim: int = -1, epsilon: float = 1e-5):
     """
     Normalize to mean = 0, std = 1, then do a diagonal affine transform.
     """
-    n_state = x.shape[-1]
-    g = torch.ones(n_state)
-    b = torch.zeros(n_state)
+    n_state = x.shape[dim]
+    affine_shape = [1] * x.dim()
+    affine_shape[dim] = n_state
+    g = x.new_ones(affine_shape)
+    b = x.new_zeros(affine_shape)
     u = torch.mean(x, dim=dim, keepdim=True)
-    s = torch.mean(torch.square(x-u), dim=dim, keepdim=True)
+    s = torch.mean(torch.square(x - u), dim=dim, keepdim=True)
     x = (x - u) * torch.rsqrt(s + epsilon)
     x = x * g + b
     return x
+
 
 def split_states(x: Tensor, n: int):
     """
@@ -72,7 +84,8 @@ def split_states(x: Tensor, n: int):
     # Unpacking syntax: start holds all dims except the last one,
     # and m is the last dimension.
     *start, m = shape_list(x)
-    return torch.reshape(x, start + [n, m//n])
+    return torch.reshape(x, start + [n, m // n])
+
 
 def merge_states(x: Tensor):
     """
@@ -80,39 +93,53 @@ def merge_states(x: Tensor):
     Essentially, split_states() reversed.
     """
     *start, a, b = shape_list(x)
-    return torch.reshape(x, start + [a*b])
+    return torch.reshape(x, start + [a * b])
 
-def conv1d(x: Tensor, nf: int, *, w_init_stdev: float = 0.02):
+
+def conv1d(
+    x: Tensor,
+    nf: int,
+    *,
+    w_init_stdev: float = 0.02,
+    parameters: dict | None = None,
+    scope: str = "conv1d",
+):
     """
     Custom implementation of a 1D convolution operation.
 
     Args:
         :param x: Tensor: The input tensor on which the 1D convolution will be applied.
         :param nf: int: The number of filters (also called output channels) for the convolution.
-        :param w_init_stdev: float = 0.02: This is the initial value for the weights (w),
-            which is set by default to 0.02. Instead of being a weight initializer like
-            in neural networks, it simply fills the weight tensor with this constant value.
+        :param w_init_stdev: float = 0.02: Standard deviation of the weight initializer.
+            Weights are sampled from a zero-mean
+            normal distribution with this standard deviation.
+        :param parameters: Optional dictionary used to reuse weights across calls.
+        :param scope: Unique name for this projection in the parameter dictionary.
     """
     # nx represents the number of input channels/features
     *start, nx = shape_list(x)
-    # Initialize weights
-    # 1 as the first dimension ensures that the convolution operates
-    # along the sequence dimension.
-    w = torch.full([1, nx, nf], fill_value=w_init_stdev)
-    # Initialize bias as a vector of zeros with size `nf`,
-    # meaning that there's one bias value for each output channel.
-    b = torch.zeros(nf)
+    # GPT-2's "conv1d" is a linear projection applied at each position.
+    # Reuse its parameters when generating subsequent tokens.
+    if parameters is None:
+        parameters = {}
+    if scope + "/w" not in parameters:
+        parameters[scope + "/w"] = x.new_empty(1, nx, nf).normal_(std=w_init_stdev)
+        parameters[scope + "/b"] = x.new_zeros(nf)
+    w = parameters[scope + "/w"]
+    b = parameters[scope + "/b"]
     # Perform matrix multiplication
     c = torch.reshape(
         torch.matmul(
-            torch.reshape(x, [-1, nx]), # Reshape input to 2D: [batch*length, nx]
-            torch.reshape(w, [-1, nf])  # Reshape weights to 2D: [nx, nf]
-        ) + b, # Add bias
-        start + [nf] # Reshape the result back to original dimensions with `nf`
+            torch.reshape(x, [-1, nx]),  # Reshape input to 2D: [batch*length, nx]
+            torch.reshape(w, [-1, nf]),  # Reshape weights to 2D: [nx, nf]
+        )
+        + b,  # Add bias
+        start + [nf],  # Reshape the result back to original dimensions with `nf`
     )
     return c
 
-def attention_mask(nd: int, ns: int, *, dtype):
+
+def attention_mask(nd: int, ns: int, *, dtype, device=None):
     """
     This function generates a lower triangular matrix that is used as an attention mask.
     The mask ensures that position i in the sequence can only attend to positions ≤ i,
@@ -132,12 +159,25 @@ def attention_mask(nd: int, ns: int, *, dtype):
         :param ns: Number of columns in the mask (typically, the length of the source sequence in encoding).
         :param dtype: The data type to which the final mask is cast (e.g., torch.int32).
     """
-    i = torch.arange(start=0, end=nd)[:, None] # Creates a column vector of shape [nd, 1]
-    j = torch.arange(start=0, end=ns)          # Creates a row vector of shape [ns]
-    m = i >= j - ns + nd                       # Generates the lower triangular mask
-    return m.type(dtype)                       # Casts the mask to the specified dtype
+    i = torch.arange(start=0, end=nd, device=device)[
+        :, None
+    ]  # Creates a column vector of shape [nd, 1]
+    j = torch.arange(
+        start=0, end=ns, device=device
+    )  # Creates a row vector of shape [ns]
+    m = i >= j - ns + nd  # Generates the lower triangular mask
+    return m.type(dtype)  # Casts the mask to the specified dtype
 
-def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
+
+def attn(
+    x: Tensor,
+    n_state: int,
+    *,
+    past: Tensor | None,
+    hparams: HParams,
+    parameters: dict | None = None,
+    scope: str = "attn",
+):
     """
     This function computes multi-head self-attention with
     the option to incorporate past memory.
@@ -145,9 +185,9 @@ def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
     Args:
         :param x: Input tensor of shape [batch_size, sequence_length, features].
             Represents the input sequence embeddings on which attention will be computed.
-        :param n_state: Dimensionality of the attention projection space. This represents the 
+        :param n_state: Dimensionality of the attention projection space. This represents the
             number of features per head multiplied by the number of attention heads.
-        :param past: A tensor of shape [batch_size, hparams.n_layer, 2, hparams.n_head,
+        :param past: A tensor of shape [batch_size, 2, hparams.n_head,
             sequence, hparams.n_embd // hparams.n_head].
             Represents the past keys and values from previous steps of the attention mechanism.
             If provided, these past key-value pairs will be concatenated to the current ones
@@ -157,15 +197,16 @@ def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
         Tuple[Tensor, Tensor]:
             - a: The output tensor after applying multi-head attention and projecting the result,
                 of shape [batch_size, sequence_length, n_state].
-            - present: A tensor containing the current keys and values for the attention mechanism, 
-                of shape [batch_size, hparams.n_layer, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head].
+            - present: A tensor containing the current keys and values for the attention mechanism,
+                of shape [batch_size, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head].
                 This can be used as input to 'past' in future calls to maintain continuity of memory across time steps.
     """
-    print(f"x shape at the start of attn(): {x.shape}")
     assert x.dim() == 3  # Should be [batch, sequence, features]
     assert n_state % hparams.n_head == 0
     if past is not None:
-        assert past.dim() == 5  # Should be [batch, 2, heads, sequence, features], where 2 is [k, v]
+        assert (
+            past.dim() == 5
+        )  # Should be [batch, 2, heads, sequence, features], where 2 is [k, v]
 
     def split_heads(x: Tensor):
         # From [batch, sequence, features] to [batch, sequence, heads, features]
@@ -180,42 +221,30 @@ def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
     def mask_attn_weights(w: Tensor):
         # w has shape [batch, heads, dst_sequence, src_sequence], where information flows from src to dst.
         _, _, nd, ns = shape_list(w)
-        b = attention_mask(nd, ns, dtype=w.dtype)
+        b = attention_mask(nd, ns, dtype=torch.bool, device=w.device)
         # Reshape b to match the shape of the attention weights w
         # The first two dimensions ([1, 1]) are for broadcasting
         # across the batch and heads dimensions, ensuring the mask
         # is applied independently to each batch and attention head.
         b = torch.reshape(b, [1, 1, nd, ns])
-        # w * b: This keeps the attention weights where b = 1 (i.e., for valid positions, meaning
-        # the current and past tokens).
-        # 1 - b: This creates a mask where b = 0, i.e., positions in the upper triangular part (future tokens).
-        # large_negative_value * (1 - b) assigns a very large negative value (-1e10) to positions
-        # in the upper triangular part (softmax will treat those positions as having near-zero probability).
-        large_negative_value = torch.tensor(1e10, dtype=w.dtype)
-        w = w * b - large_negative_value * (1 - b)
-        return w
+        # Future positions receive zero probability after softmax. masked_fill
+        # also avoids overflow and inf * 0 when using float16.
+        return w.masked_fill(~b, float("-inf"))
 
     def multihead_attn(q: Tensor, k: Tensor, v: Tensor):
         # q, k, v have shape [batch, heads, sequence, features]
-        print(f"q shape in multihead_attn: {q.shape}")
-        print(f"k.mT shape in multihead_attn: {k.mT.shape}")
         w = torch.matmul(q, k.mT)
         # Attention weights are scaled by the inverse square root of the key's dimensionality
         d_k = v.size(-1)
-        w = w / torch.sqrt(torch.tensor(d_k, dtype=w.dtype))
+        w = w / d_k**0.5
         w = mask_attn_weights(w)
-        print(f"w shape in multihead_attn: {w.shape}")
         w = softmax(w)
         a = torch.matmul(w, v)
         return a
 
     # Increases the number of features by 3 times to then generate q, k, v
-    c = conv1d(x, n_state*3)
-    print(f"c shape: {c.shape}")
+    c = conv1d(x, n_state * 3, parameters=parameters, scope=scope + "/c_attn")
     q, k, v = map(split_heads, c.chunk(3, dim=2))
-    print(f"q shape: {q.shape}")
-    print(f"k shape: {k.shape}")
-    print(f"v shape: {v.shape}")
     present = torch.stack([k, v], dim=1)
     if past is not None:
         # If past is provided, it means that there is previous
@@ -228,34 +257,59 @@ def attn(x: Tensor, n_state: int, *, past: Tensor | None, hparams: HParams):
     # Project it back to the original number of features (n_state).
     # This step is similar to the final dense layer after attention
     # in a Transformer block.
-    a = conv1d(a, n_state)
+    a = conv1d(a, n_state, parameters=parameters, scope=scope + "/c_proj")
     return a, present
 
-def mlp(x: Tensor, n_state: int):
+
+def mlp(x: Tensor, n_state: int, *, parameters: dict | None = None, scope: str = "mlp"):
     """
     2-layer fully connected neural network that applies
     a GELU activation after the first layer.
     """
     nx = x.size(-1)
-    h = gelu(conv1d(x, n_state))
-    h2 = conv1d(h, nx)
+    h = gelu(conv1d(x, n_state, parameters=parameters, scope=scope + "/c_fc"))
+    h2 = conv1d(h, nx, parameters=parameters, scope=scope + "/c_proj")
     return h2
 
-def block(x: Tensor, *, past: Tensor | None, hparams: HParams):
+
+def block(
+    x: Tensor,
+    *,
+    past: Tensor | None,
+    hparams: HParams,
+    parameters: dict | None = None,
+    scope: str = "block",
+):
     """
     Attention block:
     It first applies multi-head attention, adds the residual connection,
     and follows it up with an MLP block.
     """
     nx = x.size(-1)
-    a, present = attn(norm(x), nx, past=past, hparams=hparams)
+    a, present = attn(
+        norm(x),
+        nx,
+        past=past,
+        hparams=hparams,
+        parameters=parameters,
+        scope=scope + "/attn",
+    )
     x = x + a
-    m = mlp(norm(x), nx*4)
+    m = mlp(norm(x), nx * 4, parameters=parameters, scope=scope + "/mlp")
     x = x + m
     return x, present
 
+
 def past_shape(*, hparams: HParams, batch_size=None, sequence=None):
-    return [batch_size, hparams.n_layer, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head]
+    return [
+        batch_size,
+        hparams.n_layer,
+        2,
+        hparams.n_head,
+        sequence,
+        hparams.n_embd // hparams.n_head,
+    ]
+
 
 def expand_tile(value: Tensor, size: int):
     """
@@ -274,6 +328,7 @@ def expand_tile(value: Tensor, size: int):
     # The *([1] * value.dim()) ensures the tensor is repeated
     # only along the new dimension while keeping the other dimensions unchanged.
     return value.repeat(size, *([1] * value.dim()))
+
 
 def positions_for(tokens: Tensor, past_length: int):
     """
@@ -295,16 +350,25 @@ def positions_for(tokens: Tensor, past_length: int):
         Tensor: The positions of the tokens adjusted by the past length, expanded for each batch.
     """
     batch_size = tokens.size(0)  # Get the batch size
-    nsteps = tokens.size(1)      # Get the number of steps or sequence length
+    nsteps = tokens.size(1)  # Get the number of steps or sequence length
     # Use expand_tile() to repeat the positions for each batch
-    return expand_tile(past_length + torch.arange(nsteps), batch_size)
+    return expand_tile(
+        past_length + torch.arange(nsteps, device=tokens.device), batch_size
+    )
 
-def model(hparams: HParams, X: Tensor, past: Tensor | None = None):
+
+def model(
+    hparams: HParams,
+    X: Tensor,
+    past: Tensor | None = None,
+    *,
+    parameters: dict | None = None,
+):
     """
     Constructs a transformer model based on the given hyperparameters and input data.
 
-    This function initializes the model parameters, performs embedding lookups for the input tokens,
-    and processes the input through multiple transformer layers. It returns the computed logits for 
+    This function initializes or reuses model parameters, performs embedding lookups for the input tokens,
+    and processes the input through multiple transformer layers. It returns the computed logits for
     language modeling as well as the present key-value pairs for attention mechanisms.
 
     Args:
@@ -314,35 +378,42 @@ def model(hparams: HParams, X: Tensor, past: Tensor | None = None):
             - n_vocab: The size of the vocabulary.
             - n_layer: The number of transformer layers to stack.
         :param X: A tensor of shape (batch_size, sequence_length) containing token IDs for the input.
-        :param past: A tensor containing past key-value pairs for attention layers. 
+        :param past: A tensor containing past key-value pairs for attention layers.
             Shape should be
             [batch_size, hparams.n_layer, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head].
             If None, past attention context is not used.
+        :param parameters: Dictionary holding embeddings and projection weights.
+            Pass the same dictionary to every call when reusing past context.
 
     Returns:
         dict: A dictionary containing:
             - 'present': A tensor of shape
               [batch_size, hparams.n_layer, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head]
               containing the key-value pairs for each layer.
-            - 'logits': A tensor of shape (batch_size, sequence_length, n_vocab) containing the predicted 
+            - 'logits': A tensor of shape (batch_size, sequence_length, n_vocab) containing the predicted
               token logits for the input sequences.
     """
     results = {}
     batch, sequence = shape_list(X)
 
-    # Initialize positional and token embeddings with the specified shapes
-    wpe = torch.normal(0.0, 0.01, (hparams.n_ctx, hparams.n_embd))    # Positional Embeddings
-    wte = torch.normal(0.0, 0.02, (hparams.n_vocab, hparams.n_embd))  # Token Embeddings
+    if past is not None and parameters is None:
+        raise ValueError(
+            "Pass the same parameters dictionary when reusing past context"
+        )
+    if parameters is None:
+        parameters = {}
+    if "wpe" not in parameters:
+        parameters["wpe"] = torch.empty(
+            hparams.n_ctx, hparams.n_embd, device=X.device
+        ).normal_(std=0.01)
+        parameters["wte"] = torch.empty(
+            hparams.n_vocab, hparams.n_embd, device=X.device
+        ).normal_(std=0.02)
+    wpe, wte = parameters["wpe"], parameters["wte"]
     past_length = 0 if past is None else past.shape[-2]
     # Gather token and positional embeddings
 
-    print(f"Shape of X: {X.shape}")
-    print(f"Max index in X: {X.max()}")
-    print(f"Shape of wte: {wte.shape}")
-    print(f"Shape of wpe: {wpe.shape}")
-
     h = wte[X] + wpe[positions_for(X, past_length)]
-    print(f"Shape of h: {h.shape}")
 
     # Initialize presents and pasts for the transformer layers
     presents = []
@@ -350,17 +421,19 @@ def model(hparams: HParams, X: Tensor, past: Tensor | None = None):
     assert len(pasts) == hparams.n_layer
     # Loop through each transformer layer
     for layer, past in enumerate(pasts):
-        h, present = block(h, past=past, hparams=hparams)
+        h, present = block(
+            h, past=past, hparams=hparams, parameters=parameters, scope=f"h{layer}"
+        )
         presents.append(present)
     # Store the present values for all layers
-    results['present'] = torch.stack(presents, dim=1)
+    results["present"] = torch.stack(presents, dim=1)
     # Apply layer normalization to the final output
     h = norm(h)
 
     # Prepare the logits for language model loss
-    h_flat = torch.reshape(h, [batch*sequence, hparams.n_embd])
+    h_flat = torch.reshape(h, [batch * sequence, hparams.n_embd])
     logits = torch.matmul(h_flat, wte.mT)
     logits = torch.reshape(logits, [batch, sequence, hparams.n_vocab])
     # Store logits in results
-    results['logits'] = logits
+    results["logits"] = logits
     return results
